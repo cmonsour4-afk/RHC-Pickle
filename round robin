@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The RHC Loser's Bracket</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body{margin:0}</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// localStorage-backed replacement for Claude artifact storage (same async API)
+const appStorage = {
+  async get(key) {
+    const v = localStorage.getItem(key);
+    if (v === null) throw new Error("not found");
+    return { key, value: v };
+  },
+  async set(key, value) { localStorage.setItem(key, value); return { key, value }; },
+  async delete(key) { localStorage.removeItem(key); return { key, deleted: true }; },
+};
+</script>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ---------- Round robin schedules (each player partners every other player exactly once) ----------
+const SCHEDULES = {
+  4: [
+    [{ a: [0, 1], b: [2, 3] }],
+    [{ a: [0, 2], b: [1, 3] }],
+    [{ a: [0, 3], b: [1, 2] }],
+  ],
+  8: [
+    [{ a: [0, 1], b: [2, 3] }, { a: [4, 5], b: [6, 7] }],
+    [{ a: [0, 2], b: [1, 3] }, { a: [4, 6], b: [5, 7] }],
+    [{ a: [0, 3], b: [1, 2] }, { a: [4, 7], b: [5, 6] }],
+    [{ a: [0, 4], b: [1, 5] }, { a: [2, 6], b: [3, 7] }],
+    [{ a: [0, 5], b: [1, 4] }, { a: [2, 7], b: [3, 6] }],
+    [{ a: [0, 6], b: [1, 7] }, { a: [2, 4], b: [3, 5] }],
+    [{ a: [0, 7], b: [1, 6] }, { a: [2, 5], b: [3, 4] }],
+  ],
+};
+
+// 12-player rotation: 11 rounds, 3 courts. Cyclic whist design — every player
+// partners every other player exactly once and opposes everyone exactly twice.
+// Base round (∞=11 over Z11): (11,0 v 1,3) (6,7 v 2,9) (5,8 v 4,10), rotated mod 11.
+SCHEDULES[12] = Array.from({ length: 11 }, (_, t) => {
+  const m = (x) => (x + t) % 11;
+  return [
+    { a: [11, m(0)], b: [m(1), m(3)] },
+    { a: [m(6), m(7)], b: [m(2), m(9)] },
+    { a: [m(5), m(8)], b: [m(4), m(10)] },
+  ];
+});
+
+const TONES = [
+  { id: "sec", label: "SEC Broadcast" },
+  { id: "trash", label: "Trash Talk" },
+  { id: "writer", label: "Sports Writer" },
+];
+
+const C = {
+  ink: "#122E22",      // deep evergreen — dark surfaces & text
+  blue: "#33604B",     // club green — primary buttons & labels
+  blueDeep: "#1E4234",
+  green: "#1E4234",    // deep clubhouse green — confirm/success
+  yellow: "#C9A85C",   // brass gold — crown, leader, accents
+  chalk: "#F6F2E7",    // cream
+  line: "#DAD2BE",
+};
+
+const STORAGE_KEY = "pb-ai-tournament-v1";
+const RECORDS_KEY = "pb-club-records-v1";
+
+function PickleballAITournament() {
+  const [phase, setPhase] = useState("setup"); // setup | play
+  const [size, setSize] = useState(8);
+  const [names, setNames] = useState(Array(8).fill(""));
+  const [players, setPlayers] = useState([]);
+  const [scores, setScores] = useState({}); // key `${r}-${c}` -> {a:'',b:''}
+  const [extraRounds, setExtraRounds] = useState(0); // bonus rounds beyond the base rotation
+  const [tone, setTone] = useState("sec");
+  const [aiText, setAiText] = useState("");
+  const [aiTitle, setAiTitle] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [records, setRecords] = useState(null); // all-time club records (shared)
+  const [logged, setLogged] = useState(false);  // has this tournament been logged
+  const saveTimer = useRef(null);
+
+  // ---------- Persistence (SHARED — one live scoreboard for everyone) ----------
+  const loadShared = async () => {
+    try {
+      const res = await appStorage.get(STORAGE_KEY, true);
+      if (res && res.value) {
+        const s = JSON.parse(res.value);
+        if (s.phase === "play" && Array.isArray(s.players) && s.players.length) {
+          setPhase("play");
+          setSize(s.players.length);
+          setPlayers(s.players);
+          setScores(s.scores || {});
+          setExtraRounds(s.extraRounds || 0);
+          setTone(s.tone || "sec");
+          setLogged(!!s.logged);
+          return true;
+        }
+      }
+    } catch (e) {
+      // no saved tournament — fresh start
+    }
+    return false;
+  };
+
+  const loadRecords = async () => {
+    try {
+      const res = await appStorage.get(RECORDS_KEY, true);
+      if (res && res.value) setRecords(JSON.parse(res.value));
+    } catch (e) {
+      // no records yet
+    }
+  };
+
+  useEffect(() => {
+    (async () => {
+      await loadShared();
+      await loadRecords();
+      setLoaded(true);
+    })();
+  }, []);
+
+  const refreshScores = async () => {
+    setRefreshing(true);
+    await loadShared();
+    await loadRecords();
+    setRefreshing(false);
+  };
+
+  useEffect(() => {
+    if (!loaded || phase !== "play") return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await appStorage.set(
+          STORAGE_KEY,
+          JSON.stringify({ phase, players, scores, tone, logged, extraRounds }),
+          true
+        );
+      } catch (e) {
+        console.error("save failed", e);
+      }
+    }, 600);
+    return () => saveTimer.current && clearTimeout(saveTimer.current);
+  }, [phase, players, scores, tone, logged, extraRounds, loaded]);
+
+  // ---------- Derived ----------
+  const baseSchedule = SCHEDULES[players.length] || [];
+  const schedule = [...baseSchedule];
+  for (let i = 0; i < extraRounds; i++) {
+    if (baseSchedule.length) schedule.push(baseSchedule[i % baseSchedule.length]);
+  }
+  const totalMatches = schedule.reduce((n, r) => n + r.length, 0);
+
+  const parsed = (v) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+
+  const matchComplete = (r, c) => {
+    const s = scores[`${r}-${c}`];
+    if (!s) return false;
+    const a = parsed(s.a), b = parsed(s.b);
+    return a !== null && b !== null && a !== b;
+  };
+
+  const completedCount = schedule.reduce(
+    (n, round, r) => n + round.reduce((m, _, c) => m + (matchComplete(r, c) ? 1 : 0), 0),
+    0
+  );
+  const allDone = totalMatches > 0 && completedCount === totalMatches;
+
+  const computeStandings = (roundLimit) => {
+    const rows = players.map((p, i) => ({
+      i, name: p, w: 0, l: 0, pf: 0, pa: 0,
+    }));
+    schedule.forEach((round, r) => {
+      if (roundLimit !== undefined && r >= roundLimit) return;
+      round.forEach((m, c) => {
+        if (!matchComplete(r, c)) return;
+        const s = scores[`${r}-${c}`];
+        const a = parsed(s.a), b = parsed(s.b);
+        const aWon = a > b;
+        m.a.forEach((p) => { rows[p].pf += a; rows[p].pa += b; aWon ? rows[p].w++ : rows[p].l++; });
+        m.b.forEach((p) => { rows[p].pf += b; rows[p].pa += a; aWon ? rows[p].l++ : rows[p].w++; });
+      });
+    });
+    rows.forEach((r) => (r.diff = r.pf - r.pa));
+    rows.sort((x, y) => y.w - x.w || y.diff - x.diff || y.pf - x.pf);
+    return rows;
+  };
+
+  const standings = computeStandings();
+
+  // King of the Court: after each fully completed round, the cumulative
+  // standings leader wears the crown. Reigns = total rounds held at #1.
+  const roundDone = (r) => schedule[r].every((_, c) => matchComplete(r, c));
+  const crown = (() => {
+    const reigns = players.map(() => 0);
+    let king = null;
+    for (let r = 0; r < schedule.length; r++) {
+      let allPriorDone = true;
+      for (let k = 0; k <= r; k++) if (!roundDone(k)) { allPriorDone = false; break; }
+      if (!allPriorDone) break;
+      const leader = computeStandings(r + 1)[0];
+      reigns[leader.i]++;
+      king = leader.i;
+    }
+    return { reigns, king };
+  })();
+
+  const nextRoundIdx = schedule.findIndex((round, r) =>
+    round.some((_, c) => !matchComplete(r, c))
+  );
+
+  // ---------- Commentary engine (runs locally — no network needed) ----------
+  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+  const teamName = (m, side) => m[side].map((p) => players[p]).join(" & ");
+
+  const getFacts = () => {
+    const done = [];
+    schedule.forEach((round, r) => {
+      round.forEach((m, c) => {
+        if (!matchComplete(r, c)) return;
+        const s = scores[`${r}-${c}`];
+        const a = parsed(s.a), b = parsed(s.b);
+        done.push({ r, m, a, b, margin: Math.abs(a - b) });
+      });
+    });
+    const leader = standings[0];
+    const cellar = standings[standings.length - 1];
+    const blowout = done.length ? done.reduce((x, y) => (y.margin > x.margin ? y : x)) : null;
+    const nailbiter = done.length ? done.reduce((x, y) => (y.margin < x.margin ? y : x)) : null;
+    const undefeated = standings.filter((p) => p.w > 0 && p.l === 0);
+    const winless = standings.filter((p) => p.l > 0 && p.w === 0);
+    return { done, leader, cellar, blowout, nailbiter, undefeated, winless };
+  };
+
+  const blowoutLine = (f) =>
+    f.blowout
+      ? {
+          w: f.blowout.a > f.blowout.b ? teamName(f.blowout.m, "a") : teamName(f.blowout.m, "b"),
+          l: f.blowout.a > f.blowout.b ? teamName(f.blowout.m, "b") : teamName(f.blowout.m, "a"),
+          hi: Math.max(f.blowout.a, f.blowout.b),
+          lo: Math.min(f.blowout.a, f.blowout.b),
+        }
+      : null;
+
+  const generatePreview = () => {
+    if (nextRoundIdx < 0) return "";
+    const round = schedule[nextRoundIdx];
+    const f = getFacts();
+    const out = [];
+    const opener = {
+      sec: [
+        `Folks, buckle up — Round ${nextRoundIdx + 1} of the RHC Loser's Bracket is about to get underway, and you can feel the humidity AND the tension out here.`,
+        `Welcome back to River Hills, where Round ${nextRoundIdx + 1} is shaping up like a fourth quarter in Oxford — anything can happen and it usually does.`,
+      ],
+      trash: [
+        `Round ${nextRoundIdx + 1} incoming, and somebody's about to get their feelings hurt.`,
+        `Alright, Round ${nextRoundIdx + 1}. Stretch those hammies, gentlemen — the excuses start now.`,
+      ],
+      writer: [
+        `Round ${nextRoundIdx + 1} arrives with the standings still unsettled and reputations very much in play.`,
+        `The schedule turns to Round ${nextRoundIdx + 1}, and with it, the math starts to matter.`,
+      ],
+    };
+    out.push(pick(opener[tone]));
+    round.forEach((m, c) => {
+      const A = teamName(m, "a"), B = teamName(m, "b");
+      const court = round.length > 1 ? `On Court ${c + 1}, ` : "";
+      const lines = {
+        sec: [
+          `${court}${A} square off with ${B} — and I tell you what, neither one of these teams came here to shake hands.`,
+          `${court}it's ${A} against ${B}, and momentum, my friends, is a real thing.`,
+        ],
+        trash: [
+          `${court}${A} take on ${B}. One of these teams is about to be very quiet in the group chat.`,
+          `${court}${A} vs ${B} — dinks will be thrown, friendships will be tested.`,
+        ],
+        writer: [
+          `${court}${A} meet ${B} in a matchup that could tilt the leaderboard.`,
+          `${court}${A} face ${B}, and the point differential column is watching.`,
+        ],
+      };
+      out.push(pick(lines[tone]));
+    });
+    if (f.done.length && f.leader.w > 0) {
+      const l = {
+        sec: `All eyes on ${f.leader.name}, sitting at ${f.leader.w}–${f.leader.l} — that's a player with something to prove and everything to lose.`,
+        trash: `${f.leader.name} is up top at ${f.leader.w}–${f.leader.l} and definitely already practicing the trophy speech. Somebody humble him.`,
+        writer: `${f.leader.name} leads at ${f.leader.w}–${f.leader.l}; the field's job this round is simple, if not easy.`,
+      };
+      out.push(l[tone]);
+    }
+    if (crown.king !== null) {
+      const k = players[crown.king];
+      const kl = {
+        sec: `And don't forget — ${k} wears the crown. Heavy is the head, folks. Heavy is the head.`,
+        trash: `Reminder: ${k} is still King of the Court, and yes, he WILL bring it up unprompted.`,
+        writer: `${k} holds the crown entering the round. Thrones at River Hills have proven temporary.`,
+      };
+      out.push(kl[tone]);
+    }
+    return out.join(" ");
+  };
+
+  const generateRecap = () => {
+    const f = getFacts();
+    if (!f.done.length) return "";
+    const out = [];
+    const bo = blowoutLine(f);
+    if (allDone) {
+      const champ = {
+        sec: [
+          `Ballgame! When the dust settled at River Hills, it was ${f.leader.name} standing tall at ${f.leader.w}–${f.leader.l} with a ${f.leader.diff >= 0 ? "+" : ""}${f.leader.diff} point differential — a performance for the ages, folks.`,
+          `They'll be talking about this one at the clubhouse for a while — ${f.leader.name} takes the RHC Loser's Bracket at ${f.leader.w}–${f.leader.l}, and he earned every point of that ${f.leader.diff >= 0 ? "+" : ""}${f.leader.diff}.`,
+        ],
+        trash: [
+          `It's over, and yes, ${f.leader.name} won at ${f.leader.w}–${f.leader.l}. Go ahead and mute the group chat now, he's going to be insufferable.`,
+          `${f.leader.name} takes the title at ${f.leader.w}–${f.leader.l} with a ${f.leader.diff >= 0 ? "+" : ""}${f.leader.diff} differential. The rest of you played very hard, allegedly.`,
+        ],
+        writer: [
+          `In the end the numbers were unambiguous: ${f.leader.name}, ${f.leader.w}–${f.leader.l}, ${f.leader.diff >= 0 ? "+" : ""}${f.leader.diff}. A title won on the scoreboard, not the argument.`,
+        ],
+      };
+      out.push(pick(champ[tone]));
+      const cellarL = {
+        sec: `A tip of the cap to ${f.cellar.name} at ${f.cellar.w}–${f.cellar.l} — it wasn't his day, but by golly, he showed up.`,
+        trash: `And pouring one out for ${f.cellar.name}, who went ${f.cellar.w}–${f.cellar.l} and is currently blaming his paddle, the sun, and the net, in that order.`,
+        writer: `At the bottom, ${f.cellar.name} finished ${f.cellar.w}–${f.cellar.l} — a line that reads worse than several of his games actually were.`,
+      };
+      out.push(cellarL[tone]);
+      const maxReigns = Math.max(...crown.reigns);
+      if (maxReigns > 0) {
+        const kingName = players[crown.reigns.indexOf(maxReigns)];
+        const kl = {
+          sec: `And the crown? ${kingName} sat on that throne for ${maxReigns} ${maxReigns === 1 ? "round" : "rounds"} — that's staying power, people.`,
+          trash: `Crown count: ${kingName} with ${maxReigns} ${maxReigns === 1 ? "round" : "rounds"} as king. Expect this stat in his bio by Monday.`,
+          writer: `The crown ledger closes with ${kingName} at ${maxReigns} ${maxReigns === 1 ? "reign" : "reigns"} — the tournament's quiet second title.`,
+        };
+        out.push(kl[tone]);
+      }
+    } else {
+      const mid = {
+        sec: [
+          `Here's where we stand at River Hills, folks: ${f.leader.name} leads the pack at ${f.leader.w}–${f.leader.l}, but there's a whole lot of pickleball left to play.`,
+        ],
+        trash: [
+          `Mid-event check-in: ${f.leader.name} is on top at ${f.leader.w}–${f.leader.l} and has already gotten noticeably worse at returning texts.`,
+        ],
+        writer: [
+          `At the turn: ${f.leader.name} leads at ${f.leader.w}–${f.leader.l}, differential ${f.leader.diff >= 0 ? "+" : ""}${f.leader.diff}. Position, not destiny.`,
+        ],
+      };
+      out.push(pick(mid[tone]));
+      if (f.winless.length) {
+        const names2 = f.winless.map((p) => p.name).join(" and ");
+        const wl = {
+          sec: `Meanwhile ${names2} ${f.winless.length > 1 ? "are" : "is"} still searching for that first win — and you know what they say about a wounded animal.`,
+          trash: `${names2} ${f.winless.length > 1 ? "remain" : "remains"} winless. The comeback story writes itself, or it doesn't.`,
+          writer: `${names2} ${f.winless.length > 1 ? "sit" : "sits"} winless — the round robin's cruelty is that everyone knows.`,
+        };
+        out.push(wl[tone]);
+      }
+    }
+    if (bo) {
+      const bl = {
+        sec: `The shot heard 'round Ridgewood Road: ${bo.w} hung a ${bo.hi}–${bo.lo} whupping on ${bo.l}. That one's going to leave a mark.`,
+        trash: `Biggest beatdown so far: ${bo.w} ${bo.hi}, ${bo.l} ${bo.lo}. We've filed a wellness check.`,
+        writer: `The widest margin belongs to ${bo.w}, ${bo.hi}–${bo.lo} over ${bo.l} — less a match than a statement.`,
+      };
+      out.push(bl[tone]);
+    }
+    if (f.nailbiter && f.nailbiter.margin <= 2 && f.done.length > 1) {
+      const nb = f.nailbiter;
+      const wN = nb.a > nb.b ? teamName(nb.m, "a") : teamName(nb.m, "b");
+      const lN = nb.a > nb.b ? teamName(nb.m, "b") : teamName(nb.m, "a");
+      const nl = {
+        sec: `And what about that instant classic — ${wN} edging ${lN} ${Math.max(nb.a, nb.b)}–${Math.min(nb.a, nb.b)}! That's why you play the game, folks.`,
+        trash: `Closest call: ${wN} over ${lN}, ${Math.max(nb.a, nb.b)}–${Math.min(nb.a, nb.b)}. ${lN} would like a review that does not exist.`,
+        writer: `The margins were thinnest when ${wN} slipped past ${lN}, ${Math.max(nb.a, nb.b)}–${Math.min(nb.a, nb.b)} — the kind of game standings never quite explain.`,
+      };
+      out.push(nl[tone]);
+    }
+    return out.join(" ");
+  };
+
+  const previewNextRound = () => {
+    setAiTitle(`Round ${nextRoundIdx + 1} Preview`);
+    setAiText(generatePreview());
+  };
+
+  const recapTournament = () => {
+    setAiTitle(allDone ? "Final Recap" : "Mid-Event Report");
+    setAiText(generateRecap());
+  };
+
+  // ---------- Club records ----------
+  const logResults = async () => {
+    if (!allDone || logged) return;
+    try {
+      let rec = { players: {} };
+      try {
+        const res = await appStorage.get(RECORDS_KEY, true);
+        if (res && res.value) rec = JSON.parse(res.value);
+      } catch (e) {}
+      if (!rec.players) rec.players = {};
+      if (!rec.history) rec.history = [];
+      standings.forEach((p, idx) => {
+        const key = p.name.trim().toLowerCase();
+        const r = rec.players[key] || {
+          name: p.name.trim(), w: 0, l: 0, pf: 0, pa: 0, titles: 0, crowns: 0, events: 0,
+        };
+        r.w += p.w;
+        r.l += p.l;
+        r.pf += p.pf;
+        r.pa += p.pa;
+        r.crowns += crown.reigns[p.i];
+        r.events += 1;
+        if (idx === 0) r.titles += 1;
+        rec.players[key] = r;
+      });
+      const maxR = Math.max(...crown.reigns);
+      rec.history.unshift({
+        date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+        champion: standings[0].name,
+        king: maxR > 0 ? players[crown.reigns.indexOf(maxR)] : null,
+        kingRounds: maxR,
+        playerCount: players.length,
+        rounds: schedule.length,
+      });
+      if (rec.history.length > 50) rec.history = rec.history.slice(0, 50);
+      await appStorage.set(RECORDS_KEY, JSON.stringify(rec), true);
+      setRecords(rec);
+      setLogged(true);
+    } catch (e) {
+      console.error("record log failed", e);
+    }
+  };
+
+  const recordRows = records && records.players
+    ? Object.values(records.players).sort(
+        (x, y) => y.titles - x.titles || y.w - x.w || (y.w / Math.max(1, y.w + y.l)) - (x.w / Math.max(1, x.w + x.l))
+      )
+    : [];
+
+  // ---------- Actions ----------
+  const startTournament = () => {
+    const trimmed = Array.from({ length: size }, (_, i) => (names[i] || "").trim() || `Player ${i + 1}`);
+    setPlayers(trimmed);
+    setScores({});
+    setExtraRounds(0);
+    setLogged(false);
+    setAiText("");
+    setAiTitle("");
+    setPhase("play");
+  };
+
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  const resetAll = async () => {
+    if (!confirmReset) {
+      setConfirmReset(true);
+      setTimeout(() => setConfirmReset(false), 4000);
+      return;
+    }
+    try { await appStorage.delete(STORAGE_KEY, true); } catch (e) {}
+    setConfirmReset(false);
+    setPhase("setup");
+    setPlayers([]);
+    setScores({});
+    setExtraRounds(0);
+    setAiText("");
+    setAiTitle("");
+  };
+
+  const setScore = (r, c, side, val) => {
+    if (val !== "" && !/^\d{0,2}$/.test(val)) return;
+    setScores((prev) => ({
+      ...prev,
+      [`${r}-${c}`]: { ...(prev[`${r}-${c}`] || { a: "", b: "" }), [side]: val },
+    }));
+  };
+
+  // ---------- UI ----------
+  const font = {
+    display: "'Playfair Display', Georgia, serif",
+    body: "'Barlow', 'Helvetica Neue', sans-serif",
+  };
+
+  const ClubRecords = () => (
+      <section className="mt-8">
+        <h2 style={{ fontFamily: font.display }} className="text-2xl font-bold uppercase">Club records</h2>
+        <p className="text-xs mt-1" style={{ color: "#5A6478" }}>
+          All-time, across every logged tournament. Use the same name spelling each event to keep records connected.
+        </p>
+        {recordRows.length === 0 ? (
+          <div style={{ background: "#fff", border: `2px dashed ${C.line}` }} className="mt-3 rounded px-4 py-5 text-center">
+            <div style={{ fontFamily: font.display }} className="font-bold uppercase text-sm">The record book is empty</div>
+            <p className="text-xs mt-1" style={{ color: "#5A6478" }}>
+              Finish a tournament and tap “Log results to club records” — the button appears under the champion banner once every match is scored. Career W–L, titles, and crown counts build from there.
+            </p>
+          </div>
+        ) : (
+        <>
+        <div style={{ background: "#fff", border: `2px solid ${C.ink}` }} className="mt-3 rounded overflow-hidden">
+          <div style={{ background: C.blueDeep, color: C.chalk, fontFamily: font.display }} className="grid grid-cols-12 px-3 py-2 text-xs font-bold uppercase tracking-wider">
+            <div className="col-span-4">Player</div>
+            <div className="col-span-1 text-center">Ev</div>
+            <div className="col-span-3 text-center">W–L</div>
+            <div className="col-span-2 text-center">Win%</div>
+            <div className="col-span-1 text-center">🏆</div>
+            <div className="col-span-1 text-center">👑</div>
+          </div>
+          {recordRows.map((r) => (
+            <div key={r.name} style={{ borderTop: `1px solid ${C.line}` }} className="grid grid-cols-12 px-3 py-2.5 text-sm items-center">
+              <div className="col-span-4 font-semibold truncate">{r.name}</div>
+              <div className="col-span-1 text-center">{r.events}</div>
+              <div className="col-span-3 text-center">{r.w}–{r.l}</div>
+              <div className="col-span-2 text-center">{Math.round((r.w / Math.max(1, r.w + r.l)) * 100)}%</div>
+              <div style={{ fontFamily: font.display }} className="col-span-1 text-center font-bold">{r.titles || "—"}</div>
+              <div style={{ fontFamily: font.display }} className="col-span-1 text-center font-bold">{r.crowns || "—"}</div>
+            </div>
+          ))}
+        </div>
+        {records && records.history && records.history.length > 0 && (
+          <div className="mt-4">
+            <h3 style={{ fontFamily: font.display }} className="text-lg font-bold uppercase">Past tournaments</h3>
+            <div style={{ background: "#fff", border: `2px solid ${C.line}` }} className="mt-2 rounded overflow-hidden">
+              {records.history.map((h, i) => (
+                <div key={i} style={{ borderTop: i > 0 ? `1px solid ${C.line}` : "none" }} className="px-3 py-2.5 text-sm flex items-center justify-between">
+                  <div>
+                    <span style={{ fontFamily: font.display }} className="font-bold">{h.date}</span>
+                    <span style={{ color: "#5A6478" }} className="ml-2 text-xs">{h.playerCount} players · {h.rounds} rounds</span>
+                  </div>
+                  <div className="text-right">
+                    <span className="font-semibold">🏆 {h.champion}</span>
+                    {h.king && <span style={{ color: "#5A6478" }} className="ml-2 text-xs">👑 {h.king} ({h.kingRounds})</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        </>
+        )}
+      </section>
+    );
+
+  const KitchenLine = () => (
+    <div className="flex items-center gap-0 my-6" aria-hidden="true">
+      <div style={{ height: 3, background: C.blue }} className="flex-1" />
+      <div style={{ height: 10, width: 10, borderRadius: 999, background: C.yellow, border: `2px solid ${C.ink}` }} className="mx-2" />
+      <div style={{ height: 3, background: C.blue }} className="flex-1" />
+    </div>
+  );
+
+  return (
+    <div style={{ background: C.chalk, minHeight: "100vh", fontFamily: font.body, color: C.ink }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700;800&family=Barlow:wght@400;500;600&display=swap');
+        input:focus, button:focus { outline: 3px solid ${C.yellow}; outline-offset: 2px; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+      `}</style>
+
+      {/* Header */}
+      <header style={{ background: C.ink, borderBottom: `4px solid ${C.yellow}` }} className="px-5 py-6">
+        <div className="max-w-3xl mx-auto flex items-center gap-4">
+          <svg width="72" height="72" viewBox="0 0 100 100" role="img" aria-label="RHC crest" className="flex-shrink-0">
+            <circle cx="50" cy="50" r="47" fill={C.blueDeep} stroke={C.yellow} strokeWidth="3" />
+            <circle cx="50" cy="50" r="39" fill="none" stroke={C.yellow} strokeWidth="1.2" />
+            <text x="50" y="56" textAnchor="middle" fontFamily="'Playfair Display', Georgia, serif" fontSize="27" fontWeight="700" fill={C.yellow} letterSpacing="1.5">RHC</text>
+            <text x="50" y="71" textAnchor="middle" fontFamily="'Barlow', sans-serif" fontSize="8.5" fill={C.chalk} letterSpacing="2.5">EST. 1964</text>
+          </svg>
+          <div>
+            <div style={{ color: C.yellow, fontFamily: font.display, letterSpacing: "0.2em" }} className="text-xs font-bold uppercase">
+              River Hills Club
+            </div>
+            <h1 style={{ fontFamily: font.display, color: C.chalk, lineHeight: 1.05 }} className="text-3xl font-extrabold uppercase mt-1">
+              The RHC Loser’s Bracket
+            </h1>
+            <div style={{ color: "#9DB5A6" }} className="text-sm mt-1.5">
+              Live scoring, standings, and an AI commentary booth.
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-3xl mx-auto px-5 pb-16">
+        {/* ---------------- SETUP ---------------- */}
+        {phase === "setup" && (
+          <section className="pt-8">
+            <h2 style={{ fontFamily: font.display }} className="text-2xl font-bold uppercase">Set the bracket</h2>
+            <div className="flex gap-3 mt-4">
+              {[4, 8, 12].map((n) => (
+                <button
+                  key={n}
+                  onClick={() => setSize(n)}
+                  style={{
+                    fontFamily: font.display,
+                    background: size === n ? C.blue : "transparent",
+                    color: size === n ? C.chalk : C.ink,
+                    border: `2px solid ${C.blue}`,
+                  }}
+                  className="px-5 py-2 text-lg font-bold uppercase rounded"
+                >
+                  {n} players
+                </button>
+              ))}
+            </div>
+            <p className="text-sm mt-3" style={{ color: "#5A6478" }}>
+              Doubles format — everyone partners with everyone exactly once. {size === 4 ? "3 rounds, 1 court." : size === 8 ? "7 rounds, 2 courts." : "11 rounds, 3 courts."}
+            </p>
+
+            <div className="grid grid-cols-2 gap-3 mt-6">
+              {Array.from({ length: size }).map((_, i) => (
+                <input
+                  key={i}
+                  value={names[i] || ""}
+                  onChange={(e) => {
+                    const next = [...names];
+                    next[i] = e.target.value;
+                    setNames(next);
+                  }}
+                  placeholder={`Player ${i + 1}`}
+                  maxLength={18}
+                  style={{ border: `2px solid ${C.line}`, background: "#fff" }}
+                  className="rounded px-3 py-3 text-base"
+                />
+              ))}
+            </div>
+
+            <button
+              onClick={startTournament}
+              style={{ background: C.green, color: C.chalk, fontFamily: font.display }}
+              className="mt-6 w-full py-4 rounded text-2xl font-extrabold uppercase tracking-wide"
+            >
+              First serve
+            </button>
+            <ClubRecords />
+          </section>
+        )}
+
+        {/* ---------------- PLAY ---------------- */}
+        {phase === "play" && (
+          <>
+            {/* Standings — the scoreboard */}
+            <section className="pt-8">
+              <div className="flex items-baseline justify-between">
+                <h2 style={{ fontFamily: font.display }} className="text-2xl font-bold uppercase">Standings</h2>
+                <div className="flex items-center gap-3">
+                  <span style={{ fontFamily: font.display, color: C.blue }} className="text-sm font-bold uppercase">
+                    {completedCount}/{totalMatches} matches
+                  </span>
+                  <button
+                    onClick={refreshScores}
+                    disabled={refreshing}
+                    style={{ border: `2px solid ${C.blue}`, color: C.blue, fontFamily: font.display }}
+                    className="px-2.5 py-1 rounded text-xs font-bold uppercase disabled:opacity-60"
+                  >
+                    {refreshing ? "Syncing..." : "↻ Refresh"}
+                  </button>
+                </div>
+              </div>
+              <p className="text-xs mt-1" style={{ color: "#5A6478" }}>
+                Scores save automatically on this device.
+              </p>
+              {crown.king !== null && !allDone && (
+                <div style={{ background: C.yellow, border: `2px solid ${C.ink}` }} className="mt-3 rounded px-4 py-2.5 flex items-center justify-between">
+                  <div>
+                    <span role="img" aria-label="crown">👑</span>
+                    <span style={{ fontFamily: font.display }} className="ml-2 text-lg font-extrabold uppercase">
+                      {players[crown.king]} is King of the Court
+                    </span>
+                  </div>
+                  <span style={{ fontFamily: font.display }} className="text-sm font-bold uppercase">
+                    {crown.reigns[crown.king]} {crown.reigns[crown.king] === 1 ? "round" : "rounds"} on the throne
+                  </span>
+                </div>
+              )}
+              <div style={{ background: "#fff", border: `2px solid ${C.ink}` }} className="mt-3 rounded overflow-hidden">
+                <div style={{ background: C.ink, color: C.chalk, fontFamily: font.display }} className="grid grid-cols-12 px-3 py-2 text-xs font-bold uppercase tracking-wider">
+                  <div className="col-span-1">#</div>
+                  <div className="col-span-4">Player</div>
+                  <div className="col-span-2 text-center">W–L</div>
+                  <div className="col-span-2 text-center">Diff</div>
+                  <div className="col-span-1 text-center">PF</div>
+                  <div className="col-span-2 text-center">👑</div>
+                </div>
+                {standings.map((r, idx) => (
+                  <div
+                    key={r.i}
+                    style={{
+                      background: idx === 0 && completedCount > 0 ? C.yellow : "transparent",
+                      borderTop: `1px solid ${C.line}`,
+                    }}
+                    className="grid grid-cols-12 px-3 py-2.5 text-sm items-center"
+                  >
+                    <div style={{ fontFamily: font.display }} className="col-span-1 font-bold">{idx + 1}</div>
+                    <div className="col-span-4 font-semibold truncate">
+                      {r.name}
+                      {allDone && idx === 0 && <span className="ml-1" role="img" aria-label="champion">🏆</span>}
+                      {!allDone && crown.king === r.i && <span className="ml-1" role="img" aria-label="king of the court">👑</span>}
+                    </div>
+                    <div className="col-span-2 text-center">{r.w}–{r.l}</div>
+                    <div className="col-span-2 text-center">{r.diff >= 0 ? "+" : ""}{r.diff}</div>
+                    <div className="col-span-1 text-center">{r.pf}</div>
+                    <div style={{ fontFamily: font.display }} className="col-span-2 text-center font-bold">
+                      {crown.reigns[r.i] > 0 ? crown.reigns[r.i] : "—"}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {allDone && (
+                <div style={{ background: C.green, color: C.chalk, fontFamily: font.display }} className="mt-3 rounded px-4 py-3 text-center">
+                  <div className="text-xl font-extrabold uppercase">{standings[0].name} takes the title</div>
+                  <div style={{ color: C.yellow }} className="text-sm font-bold uppercase mt-1">
+                    👑 Most rounds as king: {players[crown.reigns.indexOf(Math.max(...crown.reigns))]} ({Math.max(...crown.reigns)})
+                  </div>
+                </div>
+              )}
+              {allDone && !logged && (
+                <button
+                  onClick={logResults}
+                  style={{ background: C.yellow, color: C.ink, fontFamily: font.display, border: `2px solid ${C.ink}` }}
+                  className="mt-3 w-full py-3 rounded text-lg font-extrabold uppercase"
+                >
+                  Log results to club records
+                </button>
+              )}
+              {allDone && logged && (
+                <p style={{ color: C.blue, fontFamily: font.display }} className="mt-2 text-sm font-bold uppercase text-center">
+                  ✓ Results logged to club records
+                </p>
+              )}
+            </section>
+
+            <KitchenLine />
+
+            {/* Commentary booth */}
+            <section>
+              <h2 style={{ fontFamily: font.display }} className="text-2xl font-bold uppercase">Commentary booth</h2>
+              <div className="flex flex-wrap gap-2 mt-3">
+                {TONES.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => setTone(t.id)}
+                    style={{
+                      fontFamily: font.display,
+                      background: tone === t.id ? C.ink : "transparent",
+                      color: tone === t.id ? C.yellow : C.ink,
+                      border: `2px solid ${C.ink}`,
+                    }}
+                    className="px-3 py-1.5 text-sm font-bold uppercase rounded"
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex gap-3 mt-4">
+                <button
+                  onClick={previewNextRound}
+                  disabled={nextRoundIdx < 0}
+                  style={{
+                    background: nextRoundIdx < 0 ? C.line : C.blue,
+                    color: C.chalk,
+                    fontFamily: font.display,
+                  }}
+                  className="flex-1 py-3 rounded text-lg font-bold uppercase disabled:opacity-70"
+                >
+                  Preview next round
+                </button>
+                <button
+                  onClick={recapTournament}
+                  disabled={completedCount === 0}
+                  style={{
+                    background: completedCount === 0 ? C.line : C.green,
+                    color: C.chalk,
+                    fontFamily: font.display,
+                  }}
+                  className="flex-1 py-3 rounded text-lg font-bold uppercase disabled:opacity-70"
+                >
+                  {allDone ? "Final recap" : "Mid-event report"}
+                </button>
+              </div>
+              <p className="text-xs mt-2" style={{ color: "#5A6478" }}>
+                {completedCount === 0
+                  ? "Recap unlocks after the first score is entered. Round previews work anytime."
+                  : "Tap again for a fresh take — the booth never says it the same way twice."}
+              </p>
+              {aiText && (
+                <div style={{ background: C.ink, color: C.chalk }} className="mt-4 rounded p-4">
+                  <div style={{ color: C.yellow, fontFamily: font.display, letterSpacing: "0.15em" }} className="text-xs font-bold uppercase mb-2">
+                    ● Live — {aiTitle}
+                  </div>
+                  <p className="text-sm leading-relaxed whitespace-pre-wrap">{aiText}</p>
+                </div>
+              )}
+            </section>
+
+            <KitchenLine />
+
+            {/* Rounds */}
+            <section>
+              <h2 style={{ fontFamily: font.display }} className="text-2xl font-bold uppercase">Match play</h2>
+              {schedule.map((round, r) => (
+                <div key={r} className="mt-5">
+                  <div className="flex items-center gap-2">
+                    <span
+                      style={{
+                        fontFamily: font.display,
+                        background: r === nextRoundIdx ? C.yellow : C.ink,
+                        color: r === nextRoundIdx ? C.ink : C.chalk,
+                      }}
+                      className="px-3 py-1 rounded text-sm font-extrabold uppercase tracking-wide"
+                    >
+                      Round {r + 1}
+                    </span>
+                    {r === nextRoundIdx && (
+                      <span style={{ color: C.green, fontFamily: font.display }} className="text-xs font-bold uppercase">Up now</span>
+                    )}
+                  </div>
+                  {round.map((m, c) => {
+                    const s = scores[`${r}-${c}`] || { a: "", b: "" };
+                    const done = matchComplete(r, c);
+                    const a = parsed(s.a), b = parsed(s.b);
+                    return (
+                      <div
+                        key={c}
+                        style={{ background: "#fff", border: `2px solid ${done ? C.green : C.line}` }}
+                        className="mt-2 rounded p-3"
+                      >
+                        {round.length > 1 && (
+                          <div style={{ color: "#5A6478", fontFamily: font.display }} className="text-xs font-bold uppercase mb-1">
+                            Court {c + 1}
+                          </div>
+                        )}
+                        {[["a", m.a], ["b", m.b]].map(([side, team]) => {
+                          const won = done && ((side === "a" && a > b) || (side === "b" && b > a));
+                          return (
+                            <div key={side} className="flex items-center justify-between py-1.5">
+                              <div className="text-sm font-semibold truncate pr-2">
+                                {team.map((p) => players[p]).join(" & ")}
+                                {won && <span style={{ color: C.green }} className="ml-1">✓</span>}
+                              </div>
+                              <input
+                                value={s[side]}
+                                onChange={(e) => setScore(r, c, side, e.target.value)}
+                                inputMode="numeric"
+                                placeholder="—"
+                                aria-label={`Score for ${team.map((p) => players[p]).join(" and ")}`}
+                                style={{
+                                  border: `2px solid ${won ? C.green : C.line}`,
+                                  fontFamily: font.display,
+                                  background: won ? "#EAF0E6" : "#fff",
+                                }}
+                                className="w-14 text-center text-xl font-bold rounded py-1"
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+            </section>
+
+            {/* Bonus rounds */}
+            <div className="flex gap-3 mt-5">
+              <button
+                onClick={() => setExtraRounds(extraRounds + 1)}
+                style={{ background: C.blue, color: C.chalk, fontFamily: font.display }}
+                className="flex-1 py-3 rounded text-lg font-bold uppercase"
+              >
+                ＋ Add a round
+              </button>
+              {extraRounds > 0 &&
+                schedule[schedule.length - 1].every(
+                  (_, c) => {
+                    const s = scores[`${schedule.length - 1}-${c}`];
+                    return !s || (s.a === "" && s.b === "");
+                  }
+                ) && (
+                  <button
+                    onClick={() => setExtraRounds(extraRounds - 1)}
+                    style={{ border: `2px solid ${C.blue}`, color: C.blue, fontFamily: font.display }}
+                    className="flex-1 py-3 rounded text-lg font-bold uppercase"
+                  >
+                    Remove last round
+                  </button>
+                )}
+            </div>
+            <p className="text-xs mt-2" style={{ color: "#5A6478" }}>
+              Bonus rounds re-run the rotation in order, so partner pairings stay balanced. Standings and the crown keep counting.
+            </p>
+
+            <ClubRecords />
+
+            <button
+              onClick={resetAll}
+              style={{
+                border: `2px solid ${confirmReset ? "#B4432F" : C.ink}`,
+                color: confirmReset ? "#B4432F" : C.ink,
+                fontFamily: font.display,
+              }}
+              className="mt-10 w-full py-3 rounded text-lg font-bold uppercase"
+            >
+              {confirmReset ? "Tap again to confirm — starts fresh" : "New tournament"}
+            </button>
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<PickleballAITournament />);
+</script>
+</body>
+</html>
