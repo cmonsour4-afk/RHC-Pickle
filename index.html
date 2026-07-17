@@ -206,19 +206,23 @@ function PickleballAITournament() {
   // King of the Court: after each fully completed round, the cumulative
   // standings leader wears the crown. Reigns = total rounds held at #1.
   const roundDone = (r) => schedule[r].every((_, c) => matchComplete(r, c));
+  const topTies = (rows) =>
+    rows.filter((p) => p.w === rows[0].w && p.diff === rows[0].diff && p.pf === rows[0].pf);
   const crown = (() => {
     const reigns = players.map(() => 0);
-    let king = null;
+    let kings = [];
     for (let r = 0; r < schedule.length; r++) {
       let allPriorDone = true;
       for (let k = 0; k <= r; k++) if (!roundDone(k)) { allPriorDone = false; break; }
       if (!allPriorDone) break;
-      const leader = computeStandings(r + 1)[0];
-      reigns[leader.i]++;
-      king = leader.i;
+      const rows = computeStandings(r + 1);
+      const tied = topTies(rows);
+      tied.forEach((p) => reigns[p.i]++);
+      kings = tied.map((p) => p.i);
     }
-    return { reigns, king };
+    return { reigns, kings, king: kings.length ? kings[0] : null };
   })();
+  const champs = topTies(standings);
 
   const nextRoundIdx = schedule.findIndex((round, r) =>
     round.some((_, c) => !matchComplete(r, c))
@@ -418,7 +422,8 @@ function PickleballAITournament() {
       } catch (e) {}
       if (!rec.players) rec.players = {};
       if (!rec.history) rec.history = [];
-      standings.forEach((p, idx) => {
+      const champKeys = topTies(standings).map((p) => p.name.trim().toLowerCase());
+      standings.forEach((p) => {
         const key = p.name.trim().toLowerCase();
         const r = rec.players[key] || {
           name: p.name.trim(), w: 0, l: 0, pf: 0, pa: 0, titles: 0, crowns: 0, events: 0,
@@ -429,15 +434,16 @@ function PickleballAITournament() {
         r.pa += p.pa;
         r.crowns += crown.reigns[p.i];
         r.events += 1;
-        if (idx === 0) r.titles += 1;
+        if (champKeys.includes(key)) r.titles += 1;
         rec.players[key] = r;
       });
       const maxR = Math.max(...crown.reigns);
       const roundsPlayed = schedule.filter((_, r) => roundDone(r)).length;
+      const kingNames = players.filter((_, i) => crown.reigns[i] === maxR && maxR > 0);
       rec.history.unshift({
         date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
-        champion: standings[0].name,
-        king: maxR > 0 ? players[crown.reigns.indexOf(maxR)] : (completedCount > 0 ? standings[0].name : null),
+        champion: topTies(standings).map((p) => p.name).join(" & "),
+        king: kingNames.length ? kingNames.join(" & ") : (completedCount > 0 ? topTies(standings).map((p) => p.name).join(" & ") : null),
         kingRounds: maxR,
         playerCount: players.length,
         rounds: roundsPlayed,
@@ -679,16 +685,19 @@ function PickleballAITournament() {
               <p className="text-xs mt-1" style={{ color: "#5A6478" }}>
                 Scores save automatically on this device.
               </p>
-              {crown.king !== null && !allDone && (
-                <div style={{ background: C.yellow, border: `2px solid ${C.ink}` }} className="mt-3 rounded px-4 py-2.5 flex items-center justify-between">
+              {crown.kings.length > 0 && !allDone && (
+                <div style={{ background: C.yellow, border: `2px solid ${C.ink}` }} className="mt-3 rounded px-4 py-2.5 flex items-center justify-between flex-wrap gap-1">
                   <div>
                     <span role="img" aria-label="crown">👑</span>
                     <span style={{ fontFamily: font.display }} className="ml-2 text-lg font-extrabold uppercase">
-                      {players[crown.king]} is King of the Court
+                      {crown.kings.map((k) => players[k]).join(" & ")}{" "}
+                      {crown.kings.length > 1 ? "are Co-Kings of the Court" : "is King of the Court"}
                     </span>
                   </div>
                   <span style={{ fontFamily: font.display }} className="text-sm font-bold uppercase">
-                    {crown.reigns[crown.king]} {crown.reigns[crown.king] === 1 ? "round" : "rounds"} on the throne
+                    {crown.kings.length > 1
+                      ? "Sharing the throne"
+                      : `${crown.reigns[crown.kings[0]]} ${crown.reigns[crown.kings[0]] === 1 ? "round" : "rounds"} on the throne`}
                   </span>
                 </div>
               )}
@@ -713,8 +722,8 @@ function PickleballAITournament() {
                     <div style={{ fontFamily: font.display }} className="col-span-1 font-bold">{idx + 1}</div>
                     <div className="col-span-4 font-semibold truncate">
                       {r.name}
-                      {allDone && idx === 0 && <span className="ml-1" role="img" aria-label="champion">🏆</span>}
-                      {!allDone && crown.king === r.i && <span className="ml-1" role="img" aria-label="king of the court">👑</span>}
+                      {allDone && champs.some((p) => p.i === r.i) && <span className="ml-1" role="img" aria-label="champion">🏆</span>}
+                      {!allDone && crown.kings.includes(r.i) && <span className="ml-1" role="img" aria-label="king of the court">👑</span>}
                     </div>
                     <div className="col-span-2 text-center">{r.w}–{r.l}</div>
                     <div className="col-span-2 text-center">{r.diff >= 0 ? "+" : ""}{r.diff}</div>
@@ -727,9 +736,15 @@ function PickleballAITournament() {
               </div>
               {allDone && (
                 <div style={{ background: C.green, color: C.chalk, fontFamily: font.display }} className="mt-3 rounded px-4 py-3 text-center">
-                  <div className="text-xl font-extrabold uppercase">{standings[0].name} takes the title</div>
+                  <div className="text-xl font-extrabold uppercase">
+                    {champs.map((p) => p.name).join(" & ")} {champs.length > 1 ? "share the title" : "takes the title"}
+                  </div>
                   <div style={{ color: C.yellow }} className="text-sm font-bold uppercase mt-1">
-                    👑 Most rounds as king: {players[crown.reigns.indexOf(Math.max(...crown.reigns))]} ({Math.max(...crown.reigns)})
+                    👑 Most rounds as king:{" "}
+                    {players
+                      .filter((_, i) => crown.reigns[i] === Math.max(...crown.reigns) && Math.max(...crown.reigns) > 0)
+                      .join(" & ")}{" "}
+                    ({Math.max(...crown.reigns)})
                   </div>
                 </div>
               )}
@@ -744,7 +759,7 @@ function PickleballAITournament() {
               )}
               {!allDone && completedCount > 0 && !logged && (
                 <p className="text-xs mt-1 text-center" style={{ color: "#5A6478" }}>
-                  Logs current standings as final — {standings[0].name} takes the day. One log per tournament.
+                  Logs current standings as final — {champs.map((p) => p.name).join(" & ")} {champs.length > 1 ? "share the day" : "takes the day"}. One log per tournament.
                 </p>
               )}
               {logged && (
