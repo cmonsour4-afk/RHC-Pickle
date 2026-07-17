@@ -13,7 +13,6 @@
 <body>
 <div id="root"></div>
 <script>
-// localStorage-backed replacement for Claude artifact storage (same async API)
 const appStorage = {
   async get(key) {
     const v = localStorage.getItem(key);
@@ -410,7 +409,7 @@ function PickleballAITournament() {
 
   // ---------- Club records ----------
   const logResults = async () => {
-    if (!allDone || logged) return;
+    if (completedCount === 0 || logged) return;
     try {
       let rec = { players: {} };
       try {
@@ -434,13 +433,15 @@ function PickleballAITournament() {
         rec.players[key] = r;
       });
       const maxR = Math.max(...crown.reigns);
+      const roundsPlayed = schedule.filter((_, r) => roundDone(r)).length;
       rec.history.unshift({
         date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
         champion: standings[0].name,
-        king: maxR > 0 ? players[crown.reigns.indexOf(maxR)] : null,
+        king: maxR > 0 ? players[crown.reigns.indexOf(maxR)] : (completedCount > 0 ? standings[0].name : null),
         kingRounds: maxR,
         playerCount: players.length,
-        rounds: schedule.length,
+        rounds: roundsPlayed,
+        called: !allDone,
       });
       if (rec.history.length > 50) rec.history = rec.history.slice(0, 50);
       await appStorage.set(RECORDS_KEY, JSON.stringify(rec), true);
@@ -544,7 +545,7 @@ function PickleballAITournament() {
                 <div key={i} style={{ borderTop: i > 0 ? `1px solid ${C.line}` : "none" }} className="px-3 py-2.5 text-sm flex items-center justify-between">
                   <div>
                     <span style={{ fontFamily: font.display }} className="font-bold">{h.date}</span>
-                    <span style={{ color: "#5A6478" }} className="ml-2 text-xs">{h.playerCount} players · {h.rounds} rounds</span>
+                    <span style={{ color: "#5A6478" }} className="ml-2 text-xs">{h.playerCount} players · {h.rounds} {h.rounds === 1 ? "round" : "rounds"}{h.called ? " · called early" : ""}</span>
                   </div>
                   <div className="text-right">
                     <span className="font-semibold">🏆 {h.champion}</span>
@@ -732,16 +733,21 @@ function PickleballAITournament() {
                   </div>
                 </div>
               )}
-              {allDone && !logged && (
+              {completedCount > 0 && !logged && (
                 <button
                   onClick={logResults}
                   style={{ background: C.yellow, color: C.ink, fontFamily: font.display, border: `2px solid ${C.ink}` }}
                   className="mt-3 w-full py-3 rounded text-lg font-extrabold uppercase"
                 >
-                  Log results to club records
+                  {allDone ? "Log results to club records" : "Call it — log standings to club records"}
                 </button>
               )}
-              {allDone && logged && (
+              {!allDone && completedCount > 0 && !logged && (
+                <p className="text-xs mt-1 text-center" style={{ color: "#5A6478" }}>
+                  Logs current standings as final — {standings[0].name} takes the day. One log per tournament.
+                </p>
+              )}
+              {logged && (
                 <p style={{ color: C.blue, fontFamily: font.display }} className="mt-2 text-sm font-bold uppercase text-center">
                   ✓ Results logged to club records
                 </p>
