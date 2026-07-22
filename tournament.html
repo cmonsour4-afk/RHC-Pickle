@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>The King's Ladder — RHC 16-Player Tournament</title>
+<title>The King's Ladder — RHC Tournament</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
@@ -48,6 +48,7 @@ const COURT_NAMES = ["Championship Court", "Court 2", "Court 3", "Court 4"];
 
 function KingsLadder() {
   const [phase, setPhase] = useState("setup"); // setup | play | done
+  const [count, setCount] = useState(16);
   const [names, setNames] = useState(Array(16).fill(""));
   const [players, setPlayers] = useState([]);
   const [numRounds, setNumRounds] = useState(5);
@@ -67,8 +68,9 @@ function KingsLadder() {
       const res = await appStorage.get(STORAGE_KEY, true);
       if (res && res.value) {
         const s = JSON.parse(res.value);
-        if (s.players && s.players.length === 16 && s.phase !== "setup") {
+        if (s.players && s.players.length >= 8 && s.phase !== "setup") {
           setPhase(s.phase);
+          setCount(s.players.length);
           setPlayers(s.players);
           setNumRounds(s.numRounds || 5);
           setRounds(s.rounds || []);
@@ -94,7 +96,7 @@ function KingsLadder() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        await appStorage.set(STORAGE_KEY, JSON.stringify({ phase, players, numRounds, rounds, cur, logged }), true);
+        await appStorage.set(STORAGE_KEY, JSON.stringify({ phase, players, numRounds, rounds, cur, logged, count }), true);
       } catch (e) {}
     }, 500);
     return () => saveTimer.current && clearTimeout(saveTimer.current);
@@ -106,33 +108,54 @@ function KingsLadder() {
     const a = parsed(pod.a), b = parsed(pod.b);
     return a !== null && b !== null && a !== b;
   };
-  const roundDone = (r) => rounds[r] && rounds[r].every(podDone);
+  const roundPods = (r) => (rounds[r] ? rounds[r].pods : []);
+  const roundByes = (r) => (rounds[r] ? rounds[r].byes || [] : []);
+  const roundDone = (r) => rounds[r] && roundPods(r).every(podDone);
 
   // standings across all completed pods up to (and including) round limit
   const computeStandings = (limit) => {
-    const rows = players.map((p, i) => ({ i, name: p, w: 0, l: 0, pf: 0, pa: 0 }));
+    const rows = players.map((p, i) => ({ i, name: p, w: 0, l: 0, pf: 0, pa: 0, gp: 0 }));
     rounds.forEach((round, r) => {
       if (limit !== undefined && r > limit) return;
-      round.forEach((pod) => {
+      round.pods.forEach((pod) => {
         if (!podDone(pod)) return;
         const a = parsed(pod.a), b = parsed(pod.b);
         const aWon = a > b;
-        pod.teams[0].forEach((p) => { rows[p].pf += a; rows[p].pa += b; aWon ? rows[p].w++ : rows[p].l++; });
-        pod.teams[1].forEach((p) => { rows[p].pf += b; rows[p].pa += a; aWon ? rows[p].l++ : rows[p].w++; });
+        pod.teams[0].forEach((p) => { rows[p].pf += a; rows[p].pa += b; rows[p].gp++; aWon ? rows[p].w++ : rows[p].l++; });
+        pod.teams[1].forEach((p) => { rows[p].pf += b; rows[p].pa += a; rows[p].gp++; aWon ? rows[p].l++ : rows[p].w++; });
       });
     });
-    rows.forEach((r) => (r.diff = r.pf - r.pa));
-    rows.sort((x, y) => y.w - x.w || y.diff - x.diff || y.pf - x.pf);
+    rows.forEach((r) => { r.diff = r.pf - r.pa; r.pct = r.gp ? r.w / r.gp : 0; });
+    // win% first (fair when bye counts differ), then diff, then points for
+    rows.sort((x, y) => y.pct - x.pct || y.diff - x.diff || y.pf - x.pf);
     return rows;
   };
   const standings = computeStandings();
 
-  // ---------- pod generation ----------
-  const makePods = (rankedIdx, roundNo) => {
+  // byes taken so far, per player, from round history
+  const byeCounts = () => {
+    const c = players.map(() => 0);
+    rounds.forEach((rd) => (rd.byes || []).forEach((p) => c[p]++));
+    return c;
+  };
+
+  // ---------- round generation ----------
+  const makeRound = (ranked, roundNo, priorByes) => {
+    const n = ranked.length;
+    const courts = Math.floor(n / 4);
+    const numByes = n - courts * 4;
+    let byes = [];
+    if (numByes > 0) {
+      // fewest byes so far get to keep playing; among equals, lower-ranked sits
+      const cand = ranked.map((p, idx) => ({ p, idx, by: priorByes[p] }));
+      cand.sort((x, y) => x.by - y.by || y.idx - x.idx);
+      byes = cand.slice(0, numByes).map((c) => c.p);
+    }
+    const inPlay = ranked.filter((p) => !byes.includes(p));
     const pat = POD_PATTERNS[roundNo % POD_PATTERNS.length];
     const pods = [];
-    for (let i = 0; i < 16; i += 4) {
-      const seats = rankedIdx.slice(i, i + 4);
+    for (let i = 0; i < inPlay.length; i += 4) {
+      const seats = inPlay.slice(i, i + 4);
       pods.push({
         seats,
         teams: [
@@ -142,15 +165,14 @@ function KingsLadder() {
         a: "", b: "",
       });
     }
-    return pods;
+    return { pods, byes };
   };
 
   // ---------- actions ----------
   const start = () => {
-    const trimmed = Array.from({ length: 16 }, (_, i) => (names[i] || "").trim() || `Player ${i + 1}`);
+    const trimmed = Array.from({ length: count }, (_, i) => (names[i] || "").trim() || `Player ${i + 1}`);
     setPlayers(trimmed);
-    // Round 1 seeded by entry order (roster order = seeding)
-    const r1 = makePods(trimmed.map((_, i) => i), 0);
+    const r1 = makeRound(trimmed.map((_, i) => i), 0, trimmed.map(() => 0));
     setRounds([r1]);
     setCur(0);
     setLogged(false);
@@ -161,10 +183,9 @@ function KingsLadder() {
   const advance = () => {
     if (!roundDone(cur)) return;
     if (cur + 1 >= numRounds) { setPhase("done"); return; }
-    // re-seed by current standings, build next round's pods
     const ranked = computeStandings(cur).map((r) => r.i);
-    const nextPods = makePods(ranked, cur + 1);
-    setRounds((prev) => [...prev, nextPods]);
+    const next = makeRound(ranked, cur + 1, byeCounts());
+    setRounds((prev) => [...prev, next]);
     setCur(cur + 1);
     setBooth(""); setBoothTitle("");
   };
@@ -172,8 +193,8 @@ function KingsLadder() {
   const setScore = (podIdx, side, val) => {
     if (val !== "" && !/^\d{0,2}$/.test(val)) return;
     setRounds((prev) => {
-      const next = prev.map((rd) => rd.map((p) => ({ ...p })));
-      next[cur][podIdx][side] = val;
+      const next = prev.map((rd) => ({ ...rd, pods: rd.pods.map((p) => ({ ...p })) }));
+      next[cur].pods[podIdx][side] = val;
       return next;
     });
   };
@@ -183,7 +204,7 @@ function KingsLadder() {
     try { await appStorage.delete(STORAGE_KEY, true); } catch (e) {}
     setConfirmReset(false);
     setPhase("setup"); setPlayers([]); setRounds([]); setCur(0); setLogged(false);
-    setBooth(""); setBoothTitle(""); setNames(Array(16).fill(""));
+    setBooth(""); setBoothTitle(""); setCount(16); setNames(Array(16).fill(""));
   };
 
   // ---------- records ----------
@@ -224,7 +245,8 @@ function KingsLadder() {
   const pick = (a) => a[Math.floor(Math.random() * a.length)];
   const tName = (t) => t.map((p) => players[p]).join(" & ");
   const previewRound = () => {
-    const champPod = rounds[cur][0];
+    const champPod = roundPods(cur)[0];
+    const sitting = roundByes(cur).map((p) => players[p]);
     const lines = [
       pick([
         `Round ${cur + 1} at River Hills, and the ladder has done its work — the cream has risen.`,
@@ -236,9 +258,10 @@ function KingsLadder() {
       const l = standings[0];
       lines.push(`${l.name} sits atop the standings at ${l.w}–${l.l}, but a ladder is a cruel thing — one bad game and you're sliding down a court.`);
     }
+    if (sitting.length) lines.push(`Drawing a bye this round: ${sitting.join(", ")} — rest up, you're back in it next round.`);
     lines.push(pick([
-      `Down on Court 4, pride's on the line and nobody wants to close the night in the cellar.`,
       `Every court matters — climb one rung a round and you're in the title hunt by the finish.`,
+      `Down at the bottom, pride's on the line and nobody wants to close the night in the cellar.`,
     ]));
     setBoothTitle(`Round ${cur + 1} Preview`);
     setBooth(lines.join(" "));
@@ -379,7 +402,7 @@ function KingsLadder() {
         <div className="max-w-3xl mx-auto flex items-center gap-4">
           <Crest />
           <div>
-            <div style={{ color: C.gold, fontFamily: font.display, letterSpacing: "0.2em" }} className="text-xs font-bold uppercase">River Hills Club · 16-Player Tournament</div>
+            <div style={{ color: C.gold, fontFamily: font.display, letterSpacing: "0.2em" }} className="text-xs font-bold uppercase">River Hills Club · Ladder Tournament</div>
             <h1 style={{ fontFamily: font.display, color: C.chalk, lineHeight: 1.05 }} className="text-3xl font-extrabold uppercase mt-1">The King’s Ladder</h1>
             <div style={{ color: "#9DB5A6" }} className="text-sm mt-1.5">Everyone plays every round. Climb the courts. Crown a champion.</div>
           </div>
@@ -392,10 +415,35 @@ function KingsLadder() {
           <section className="pt-8">
             <h2 style={{ fontFamily: font.display }} className="text-2xl font-bold uppercase">How it works</h2>
             <p className="text-sm mt-2" style={{ color: "#3C4A40" }}>
-              Sixteen players, four courts. Each round you’re matched with three others at your level for one game to 11.
-              Win and you climb toward the Championship Court; lose and you slide down — but you never sit and you’re never out.
+              Pick your field, then each round you’re matched with three others at your level for one game to 11.
+              Win and you climb toward the Championship Court; lose and you slide down — but you never sit out for good and you’re never eliminated.
               After the final round, the best record is King of the Ladder.
             </p>
+
+            <div className="mt-5">
+              <div style={{ fontFamily: font.display }} className="text-sm font-bold uppercase">Field size</div>
+              <div className="flex gap-2.5 mt-2 items-center">
+                {[8, 12, 16].map((n) => (
+                  <button key={n} onClick={() => { setCount(n); setNames((prev) => { const a = [...prev]; a.length = Math.max(a.length, n); return a.map((x) => x || ""); }); }}
+                    style={{ fontFamily: font.display, background: count === n ? C.green : "transparent", color: count === n ? C.chalk : C.ink, border: `2px solid ${C.green}` }}
+                    className="px-5 py-2 text-lg font-bold uppercase rounded">
+                    {n}
+                  </button>
+                ))}
+                <div className="flex items-center gap-2 ml-1">
+                  <button onClick={() => setCount(Math.max(8, count - 1))} aria-label="one fewer player"
+                    style={{ border: `2px solid ${C.line}`, fontFamily: font.display }} className="w-10 h-10 rounded text-xl font-bold">–</button>
+                  <span style={{ fontFamily: font.display, minWidth: 28 }} className="text-xl font-bold text-center">{count}</span>
+                  <button onClick={() => setCount(Math.min(16, count + 1))} aria-label="one more player"
+                    style={{ border: `2px solid ${C.line}`, fontFamily: font.display }} className="w-10 h-10 rounded text-xl font-bold">+</button>
+                </div>
+              </div>
+              <p className="text-xs mt-2" style={{ color: "#5A6478" }}>
+                {count % 4 === 0
+                  ? `${count / 4} courts, no byes — everyone plays every round.`
+                  : `${Math.floor(count / 4)} courts · ${count % 4} ${count % 4 === 1 ? "player sits" : "players sit"} each round (byes rotate fairly).`}
+              </p>
+            </div>
 
             <div className="mt-5">
               <div style={{ fontFamily: font.display }} className="text-sm font-bold uppercase">Rounds</div>
@@ -413,7 +461,7 @@ function KingsLadder() {
 
             <div style={{ fontFamily: font.display }} className="text-sm font-bold uppercase mt-6">Players (seeding = entry order)</div>
             <div className="grid grid-cols-2 gap-2.5 mt-2">
-              {Array.from({ length: 16 }).map((_, i) => (
+              {Array.from({ length: count }).map((_, i) => (
                 <div key={i} className="flex items-center gap-2">
                   <span style={{ fontFamily: font.display, color: C.gold, width: 22 }} className="text-sm font-bold text-right">{i + 1}</span>
                   <input value={names[i] || ""} onChange={(e) => { const n = [...names]; n[i] = e.target.value; setNames(n); }}
@@ -449,14 +497,14 @@ function KingsLadder() {
               </p>
 
               <div className="mt-4 space-y-3">
-                {rounds[cur].map((pod, pi) => {
+                {roundPods(cur).map((pod, pi) => {
                   const done = podDone(pod);
                   const a = parsed(pod.a), b = parsed(pod.b);
                   return (
                     <div key={pi} style={{ background: "#fff", border: `2px solid ${pi === 0 ? C.gold : done ? C.green : C.line}` }} className="rounded p-3">
                       <div className="flex items-center justify-between mb-1.5">
                         <span style={{ fontFamily: font.display, color: pi === 0 ? C.gold : "#5A6478" }} className="text-sm font-extrabold uppercase tracking-wide">
-                          {pi === 0 && "👑 "}{COURT_NAMES[pi]}
+                          {pi === 0 && "👑 "}{pi === 0 ? "Championship Court" : `Court ${pi + 1}`}
                         </span>
                         {done && <span style={{ color: C.green, fontFamily: font.display }} className="text-xs font-bold uppercase">Final</span>}
                       </div>
@@ -478,6 +526,12 @@ function KingsLadder() {
                     </div>
                   );
                 })}
+                {roundByes(cur).length > 0 && (
+                  <div style={{ background: "#EFE7CF", border: `2px dashed ${C.line}` }} className="rounded px-3 py-2.5">
+                    <span style={{ fontFamily: font.display, color: "#5A6478" }} className="text-xs font-bold uppercase">Sitting this round · </span>
+                    <span className="text-sm font-semibold">{roundByes(cur).map((p) => players[p]).join(", ")}</span>
+                  </div>
+                )}
               </div>
 
               <button onClick={advance} disabled={!roundDone(cur)}
