@@ -139,31 +139,93 @@ function KingsLadder() {
     return c;
   };
 
+  // ---------- partner / opponent history ----------
+  // Counts how often each pair has partnered and opposed, from completed rounds.
+  const history = () => {
+    const P = {}, O = {};
+    players.forEach((_, i) => { P[i] = {}; O[i] = {}; });
+    rounds.forEach((rd) => rd.pods.forEach((pod) => {
+      pod.teams.forEach((tm) => {
+        P[tm[0]][tm[1]] = (P[tm[0]][tm[1]] || 0) + 1;
+        P[tm[1]][tm[0]] = (P[tm[1]][tm[0]] || 0) + 1;
+      });
+      pod.teams[0].forEach((x) => pod.teams[1].forEach((y) => {
+        O[x][y] = (O[x][y] || 0) + 1;
+        O[y][x] = (O[y][x] || 0) + 1;
+      }));
+    }));
+    return { P, O };
+  };
+
+  // For a foursome, score each of the 3 possible pairings.
+  // Repeat partners cost heavily; repeat opponents are a light tiebreaker.
+  const podCost = (seats, pat, P, O) => {
+    const t = [
+      [seats[pat[0][0]], seats[pat[0][1]]],
+      [seats[pat[1][0]], seats[pat[1][1]]],
+    ];
+    let c = 0;
+    t.forEach((tm) => { c += 1000 * ((P[tm[0]] && P[tm[0]][tm[1]]) || 0); });
+    t[0].forEach((x) => t[1].forEach((y) => { c += (O[x] && O[x][y]) || 0; }));
+    return { c, teams: t };
+  };
+  const bestPattern = (seats, P, O) => {
+    let best = null;
+    POD_PATTERNS.forEach((pat) => {
+      const r = podCost(seats, pat, P, O);
+      if (!best || r.c < best.c) best = r;
+    });
+    return best;
+  };
+
   // ---------- round generation ----------
-  const makeRound = (ranked, roundNo, priorByes) => {
+  const makeRound = (rankedRows, roundNo, priorByes) => {
+    const { P, O } = history();
+    const ranked = rankedRows.map((r) => r.i);
     const n = ranked.length;
     const courts = Math.floor(n / 4);
     const numByes = n - courts * 4;
     let byes = [];
     if (numByes > 0) {
-      // fewest byes so far get to keep playing; among equals, lower-ranked sits
+      // fewest byes so far keep playing; among equals, lower-ranked sits
       const cand = ranked.map((p, idx) => ({ p, idx, by: priorByes[p] }));
       cand.sort((x, y) => x.by - y.by || y.idx - x.idx);
       byes = cand.slice(0, numByes).map((c) => c.p);
     }
-    const inPlay = ranked.filter((p) => !byes.includes(p));
-    const pat = POD_PATTERNS[roundNo % POD_PATTERNS.length];
+    let inPlay = ranked.filter((p) => !byes.includes(p));
+
+    // Only players with IDENTICAL records may swap courts, so placement
+    // still reflects exactly how you're playing.
+    const key = {};
+    rankedRows.forEach((r) => { key[r.i] = `${r.pct}|${r.diff}|${r.pf}`; });
+    const podStart = (i) => Math.floor(i / 4) * 4;
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < inPlay.length; i++) {
+        const si = podStart(i);
+        const podI = inPlay.slice(si, si + 4);
+        if (podI.length < 4) continue;
+        const curCost = bestPattern(podI, P, O).c;
+        if (curCost < 1000) continue; // no repeat partners here
+        for (let j = 0; j < inPlay.length; j++) {
+          const sj = podStart(j);
+          if (sj === si) continue;
+          const podJ = inPlay.slice(sj, sj + 4);
+          if (podJ.length < 4) continue;
+          if (key[inPlay[i]] !== key[inPlay[j]]) continue;
+          const before = curCost + bestPattern(podJ, P, O).c;
+          const t = [...inPlay];
+          [t[i], t[j]] = [t[j], t[i]];
+          const after = bestPattern(t.slice(si, si + 4), P, O).c + bestPattern(t.slice(sj, sj + 4), P, O).c;
+          if (after < before) { inPlay = t; break; }
+        }
+      }
+    }
+
     const pods = [];
     for (let i = 0; i < inPlay.length; i += 4) {
       const seats = inPlay.slice(i, i + 4);
-      pods.push({
-        seats,
-        teams: [
-          [seats[pat[0][0]], seats[pat[0][1]]],
-          [seats[pat[1][0]], seats[pat[1][1]]],
-        ],
-        a: "", b: "",
-      });
+      const b = bestPattern(seats, P, O);
+      pods.push({ seats, teams: b.teams, a: "", b: "" });
     }
     return { pods, byes };
   };
@@ -172,7 +234,8 @@ function KingsLadder() {
   const start = () => {
     const trimmed = Array.from({ length: count }, (_, i) => (names[i] || "").trim() || `Player ${i + 1}`);
     setPlayers(trimmed);
-    const r1 = makeRound(trimmed.map((_, i) => i), 0, trimmed.map(() => 0));
+    const rows0 = trimmed.map((_, i) => ({ i, pct: 0, diff: 0, pf: 0 }));
+    const r1 = makeRound(rows0, 0, trimmed.map(() => 0));
     setRounds([r1]);
     setCur(0);
     setLogged(false);
@@ -183,8 +246,7 @@ function KingsLadder() {
   const advance = () => {
     if (!roundDone(cur)) return;
     if (cur + 1 >= numRounds) { setPhase("done"); return; }
-    const ranked = computeStandings(cur).map((r) => r.i);
-    const next = makeRound(ranked, cur + 1, byeCounts());
+    const next = makeRound(computeStandings(cur), cur + 1, byeCounts());
     setRounds((prev) => [...prev, next]);
     setCur(cur + 1);
     setBooth(""); setBoothTitle("");
@@ -237,8 +299,7 @@ function KingsLadder() {
       setLogged(true);
     } catch (e) {}
   };
-  const recordRows = records && records.players
-    ? Object.values(records.players).sort((x, y) => y.titles - x.titles || y.w - x.w || (y.w / Math.max(1, y.w + y.l)) - (x.w / Math.max(1, x.w + x.l)))
+  const recordRows = records && records.players    ? Object.values(records.players).sort((x, y) => y.titles - x.titles || y.w - x.w || (y.w / Math.max(1, y.w + y.l)) - (x.w / Math.max(1, x.w + x.l)))
     : [];
 
   // ---------- commentary (local, no network) ----------
@@ -286,6 +347,14 @@ function KingsLadder() {
   };
 
   // ---------- UI ----------
+  const partnerVariety = (() => {
+    if (!players.length) return null;
+    const { P } = history();
+    const counts = players.map((_, i) => Object.keys(P[i] || {}).length);
+    const played = players.map((_, i) => Object.values(P[i] || {}).reduce((a, b) => a + b, 0));
+    if (!played.some((x) => x > 0)) return null;
+    return { min: Math.min(...counts), max: Math.max(...counts), counts };
+  })();
   const font = { display: "'Playfair Display', Georgia, serif", body: "'Barlow', 'Helvetica Neue', sans-serif" };
   const champs = phase === "done" ? topTies(standings) : [];
 
@@ -546,6 +615,13 @@ function KingsLadder() {
 
             <section>
               <h2 style={{ fontFamily: font.display }} className="text-2xl font-bold uppercase">Standings</h2>
+              {partnerVariety && (
+                <p className="text-xs mt-1" style={{ color: "#5A6478" }}>
+                  Partner variety: {partnerVariety.min === partnerVariety.max
+                    ? `everyone has had ${partnerVariety.min} different ${partnerVariety.min === 1 ? "partner" : "partners"}`
+                    : `${partnerVariety.min}–${partnerVariety.max} different partners each`} so far.
+                </p>
+              )}
               <div className="mt-3"><StandingsTable /></div>
             </section>
 
@@ -586,6 +662,13 @@ function KingsLadder() {
             </section>
 
             <div className="mt-6"><StandingsTable /></div>
+            {partnerVariety && (
+              <p className="text-xs mt-2 text-center" style={{ color: "#5A6478" }}>
+                Partner variety: {partnerVariety.min === partnerVariety.max
+                  ? `every player had ${partnerVariety.min} different partners`
+                  : `${partnerVariety.min}–${partnerVariety.max} different partners per player`} across {numRounds} rounds.
+              </p>
+            )}
 
             {!logged ? (
               <button onClick={logResults} style={{ background: C.gold, color: C.ink, fontFamily: font.display, border: `2px solid ${C.ink}` }} className="mt-5 w-full py-4 rounded text-xl font-extrabold uppercase">
